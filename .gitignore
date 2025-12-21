@@ -1,0 +1,21 @@
+# --- Python / Environment ---
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.ipynb_checkpoints/
+
+# --- Data (Crucial for Fraud Detection) ---
+/data/raw/*
+/data/processed/*
+
+
+# --- Models ---
+# Trained model files (pickles/joblibs) are often large.
+fraud-detection/models/*.pkl
+fraud-detection/models/*.joblib
+
+# --- OS / IDE ---
+.DS_Store
+*.log
