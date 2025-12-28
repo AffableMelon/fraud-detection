@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, RandomizedSearchCV, cross_val_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
@@ -16,19 +16,21 @@ from lightgbm import LGBMClassifier
 from sklearn.metrics import (
     classification_report, confusion_matrix, 
     precision_recall_curve, auc, f1_score,
-    average_precision_score, roc_auc_score
+    average_precision_score, roc_auc_score, make_scorer
 )
 from sklearn.impute import SimpleImputer
 from imblearn.over_sampling import SMOTE
 import joblib
 import warnings
+import time
+
 warnings.filterwarnings('ignore')
 
 # Set random seed
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
-def evaluate_model(model, X_train, X_test, y_train, y_test, model_name):
+def evaluate_model(model, X_test, y_test, model_name):
     """Evaluate a trained model and return metrics"""
     # Predictions
     y_pred = model.predict(X_test)
@@ -64,6 +66,52 @@ def evaluate_model(model, X_train, X_test, y_train, y_test, model_name):
         'y_pred': y_pred,
         'y_pred_proba': y_pred_proba
     }
+
+
+def tune_and_evaluate(model, param_dist, X_train, y_train, X_test, y_test, model_name, n_iter=10):
+    """
+    Perform Hyperparameter Tuning using RandomizedSearchCV and Stratified K-Fold CV.
+    """
+    print(f"\n{'='*60}")
+    print(f"Tuning {model_name}...")
+    print(f"{'='*60}")
+    
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    
+    # Use AUC-PR as the scoring metric for imbalanced data
+    scorer = make_scorer(average_precision_score, needs_proba=True)
+    
+    search = RandomizedSearchCV(
+        estimator=model,
+        param_distributions=param_dist,
+        n_iter=n_iter,
+        scoring='average_precision', # Use string alias or scorer object
+        cv=cv,
+        verbose=1,
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
+    
+    start_time = time.time()
+    search.fit(X_train, y_train)
+    elapsed_time = time.time() - start_time
+    
+    print(f"\nTuning completed in {elapsed_time:.2f} seconds")
+    print(f"Best Params: {search.best_params_}")
+    print(f"Best CV AUC-PR: {search.best_score_:.4f}")
+    
+    # Cross-validation statistics on the best model
+    best_model = search.best_estimator_
+    cv_scores = cross_val_score(best_model, X_train, y_train, cv=cv, scoring='f1')
+    print(f"CV F1-Score: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+    
+    # Evaluate on Test Set
+    results = evaluate_model(best_model, X_test, y_test, model_name)
+    results['best_params'] = search.best_params_
+    results['cv_mean_f1'] = cv_scores.mean()
+    results['cv_std_f1'] = cv_scores.std()
+    
+    return best_model, results
 
 
 def train_ecommerce_models():
@@ -110,54 +158,42 @@ def train_ecommerce_models():
     results = []
     models = {}
     
-    # 1. Logistic Regression
+    # 1. Logistic Regression (Baseline)
     print("\n" + "-"*60)
-    print("Training Logistic Regression...")
+    print("Training Logistic Regression (Baseline)...")
     print("-"*60)
     lr = LogisticRegression(class_weight='balanced', max_iter=1000, random_state=RANDOM_STATE)
     lr.fit(X_train_balanced, y_train_balanced)
-    lr_results = evaluate_model(lr, X_train_balanced, X_test, y_train_balanced, y_test, 
-                                "E-commerce - Logistic Regression")
+    lr_results = evaluate_model(lr, X_test, y_test, "E-commerce - Logistic Regression")
     results.append(lr_results)
     models['lr'] = lr
     
-    # 2. Random Forest
-    print("\n" + "-"*60)
-    print("Training Random Forest...")
-    print("-"*60)
-    rf = RandomForestClassifier(n_estimators=100, max_depth=15, min_samples_split=10,
-                                 min_samples_leaf=5, random_state=RANDOM_STATE, n_jobs=-1)
-    rf.fit(X_train_balanced, y_train_balanced)
-    rf_results = evaluate_model(rf, X_train_balanced, X_test, y_train_balanced, y_test,
-                                "E-commerce - Random Forest")
+    # 2. Random Forest (Tuned)
+    rf_params = {
+        'n_estimators': [100, 200],
+        'max_depth': [10, 20, None],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
+    }
+    rf = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1)
+    best_rf, rf_results = tune_and_evaluate(rf, rf_params, X_train_balanced, y_train_balanced, 
+                                            X_test, y_test, "E-commerce - Random Forest", n_iter=5)
     results.append(rf_results)
-    models['rf'] = rf
+    models['rf'] = best_rf
     
-    # 3. XGBoost
-    print("\n" + "-"*60)
-    print("Training XGBoost...")
-    print("-"*60)
-    xgb = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1,
-                        subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE,
-                        eval_metric='logloss')
-    xgb.fit(X_train_balanced, y_train_balanced)
-    xgb_results = evaluate_model(xgb, X_train_balanced, X_test, y_train_balanced, y_test,
-                                 "E-commerce - XGBoost")
+    # 3. XGBoost (Tuned)
+    xgb_params = {
+        'n_estimators': [100, 200],
+        'max_depth': [3, 6, 10],
+        'learning_rate': [0.01, 0.1, 0.3],
+        'subsample': [0.7, 0.8, 1.0],
+        'colsample_bytree': [0.7, 0.8, 1.0]
+    }
+    xgb = XGBClassifier(random_state=RANDOM_STATE, eval_metric='logloss', use_label_encoder=False)
+    best_xgb, xgb_results = tune_and_evaluate(xgb, xgb_params, X_train_balanced, y_train_balanced,
+                                              X_test, y_test, "E-commerce - XGBoost", n_iter=5)
     results.append(xgb_results)
-    models['xgb'] = xgb
-    
-    # 4. LightGBM
-    print("\n" + "-"*60)
-    print("Training LightGBM...")
-    print("-"*60)
-    lgbm = LGBMClassifier(n_estimators=100, max_depth=6, learning_rate=0.1,
-                          subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE,
-                          verbose=-1)
-    lgbm.fit(X_train_balanced, y_train_balanced)
-    lgbm_results = evaluate_model(lgbm, X_train_balanced, X_test, y_train_balanced, y_test,
-                                  "E-commerce - LightGBM")
-    results.append(lgbm_results)
-    models['lgbm'] = lgbm
+    models['xgb'] = best_xgb
     
     # Model comparison
     print("\n" + "="*80)
@@ -232,48 +268,22 @@ def train_creditcard_models():
     print("-"*60)
     lr = LogisticRegression(class_weight='balanced', max_iter=1000, random_state=RANDOM_STATE)
     lr.fit(X_train_balanced, y_train_balanced)
-    lr_results = evaluate_model(lr, X_train_balanced, X_test, y_train_balanced, y_test,
-                                "Credit Card - Logistic Regression")
+    lr_results = evaluate_model(lr, X_test, y_test, "Credit Card - Logistic Regression")
     results.append(lr_results)
     models['lr'] = lr
     
-    # 2. Random Forest
-    print("\n" + "-"*60)
-    print("Training Random Forest...")
-    print("-"*60)
-    rf = RandomForestClassifier(n_estimators=100, max_depth=15, min_samples_split=10,
-                                 min_samples_leaf=5, random_state=RANDOM_STATE, n_jobs=-1)
-    rf.fit(X_train_balanced, y_train_balanced)
-    rf_results = evaluate_model(rf, X_train_balanced, X_test, y_train_balanced, y_test,
-                                "Credit Card - Random Forest")
-    results.append(rf_results)
-    models['rf'] = rf
-    
-    # 3. XGBoost
-    print("\n" + "-"*60)
-    print("Training XGBoost...")
-    print("-"*60)
-    xgb = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1,
-                        subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE,
-                        eval_metric='logloss')
-    xgb.fit(X_train_balanced, y_train_balanced)
-    xgb_results = evaluate_model(xgb, X_train_balanced, X_test, y_train_balanced, y_test,
-                                 "Credit Card - XGBoost")
+    # 2. XGBoost (Tuned)
+    xgb_params = {
+        'n_estimators': [100, 200],
+        'max_depth': [3, 6, 10],
+        'learning_rate': [0.01, 0.1, 0.3],
+        'subsample': [0.8, 1.0]
+    }
+    xgb = XGBClassifier(random_state=RANDOM_STATE, eval_metric='logloss', use_label_encoder=False)
+    best_xgb, xgb_results = tune_and_evaluate(xgb, xgb_params, X_train_balanced, y_train_balanced,
+                                              X_test, y_test, "Credit Card - XGBoost", n_iter=5)
     results.append(xgb_results)
-    models['xgb'] = xgb
-    
-    # 4. LightGBM
-    print("\n" + "-"*60)
-    print("Training LightGBM...")
-    print("-"*60)
-    lgbm = LGBMClassifier(n_estimators=100, max_depth=6, learning_rate=0.1,
-                          subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE,
-                          verbose=-1)
-    lgbm.fit(X_train_balanced, y_train_balanced)
-    lgbm_results = evaluate_model(lgbm, X_train_balanced, X_test, y_train_balanced, y_test,
-                                  "Credit Card - LightGBM")
-    results.append(lgbm_results)
-    models['lgbm'] = lgbm
+    models['xgb'] = best_xgb
     
     # Model comparison
     print("\n" + "="*80)
